@@ -1,5 +1,8 @@
 import { Gpio } from 'pigpio';
 import NanoTimer from 'nanotimer';
+import EventEmitter from 'eventemitter3';
+
+import { clockTimeToRatio, ratioToClockTime, ClockTime } from './circleUtils';
 
 function sleep(ms: number) {
     return new Promise((resolve) => {
@@ -63,12 +66,9 @@ class Task {
 
         const easedRatio = this.easing(ratioCompleted);
 
-        const stepsThatShouldHaveBeenCompleted = Math.floor(
-            this.stepsTotal * easedRatio
-        );
+        const stepsThatShouldHaveBeenCompleted = Math.floor(this.stepsTotal * easedRatio);
 
-        const stepsThisTime =
-            stepsThatShouldHaveBeenCompleted - this.stepsSoFar;
+        const stepsThisTime = stepsThatShouldHaveBeenCompleted - this.stepsSoFar;
         this.stepsSoFar = stepsThatShouldHaveBeenCompleted;
 
         if (ratioCompleted === 1) {
@@ -86,19 +86,30 @@ type StepperClassConfig = {
     pinNumbers: number[];
     stepperModel: keyof StepperConfigs;
     gearRatio?: number;
+    startingLocation?: number;
 };
 
-export class Stepper {
+type StepperEvents = {
+    step: (currentStep: number, task: Task) => unknown;
+    finish: (task: Task) => unknown;
+    start: (task: Task) => unknown;
+};
+
+export class Stepper extends EventEmitter<StepperEvents> {
     constructor({
         pinNumbers,
         stepperModel,
         gearRatio = 1,
+        startingLocation = 12,
     }: StepperClassConfig) {
-        this.pins = pinNumbers.map(
-            (pinNumber) => new Gpio(pinNumber, { mode: 0 })
-        );
+        super();
+        this.pins = pinNumbers.map((pinNumber) => new Gpio(pinNumber, { mode: 0 }));
         this.stepperConfig = stepperConfigs[stepperModel];
         this.gearRatio = gearRatio;
+
+        this.stepsPerRotation = this.stepperConfig.stepsPerRotation * this.gearRatio;
+
+        this.currentStep = (startingLocation / 12) * this.stepsPerRotation;
     }
 
     gearRatio: number;
@@ -106,6 +117,8 @@ export class Stepper {
     stepperConfig: StepperConfig;
     task?: Task;
     timer?: NanoTimer;
+    currentStep: number;
+    stepsPerRotation: number;
 
     private currentStepPatternIndex = 0;
 
@@ -138,9 +151,7 @@ export class Stepper {
 
         for (var i = 0; i < stepsRequired; i++) {
             this.incrementStepPatternIndex();
-            const stepPattern = this.stepperConfig.pattern[
-                this.currentStepPatternIndex
-            ];
+            const stepPattern = this.stepperConfig.pattern[this.currentStepPatternIndex];
 
             if (this.stepperConfig.delayAfterStep) {
                 await sleep(this.stepperConfig.delayAfterStep);
@@ -157,16 +168,24 @@ export class Stepper {
                     pin.digitalWrite(stepPattern[pinIndex]);
                 }
             }
+            this.currentStep += this.task.direction;
+            this.emit('step', this.currentStep, this.task);
         }
 
         if (this.task.isComplete) {
-            this.task.resolve(undefined);
             this.turnOff();
         }
     }
 
-    private turnOff() {
-        this.task?.reject(undefined);
+    private turnOff(error?: Error) {
+        if (this.task) {
+            if (error) {
+                this.task.reject(error);
+            } else {
+                this.task.resolve(undefined);
+                this.emit('finish', this.task);
+            }
+        }
         this.task = undefined;
         for (const pin of this.pins) {
             pin.digitalWrite(1);
@@ -177,8 +196,7 @@ export class Stepper {
         if (!this.task) {
             throw new Error('Incrementing step pattern requires a task');
         }
-        this.currentStepPatternIndex =
-            this.currentStepPatternIndex + this.task.direction;
+        this.currentStepPatternIndex = this.currentStepPatternIndex + this.task.direction;
         if (this.currentStepPatternIndex <= -1) {
             this.currentStepPatternIndex += this.stepperConfig.pattern.length;
         }
@@ -187,21 +205,91 @@ export class Stepper {
         }
     }
 
-    turn({
+    overwriteCurrentTime(newTime: ClockTime) {
+        const ratio = clockTimeToRatio(newTime);
+        this.currentStep = ratio * this.stepsPerRotation;
+    }
+
+    turnSteps({
+        steps,
+        direction,
+        duration,
+        easing = (x: number) => x,
+    }: {
+        steps: number;
+        direction: 1 | -1;
+        duration: number;
+        easing?: (x: number) => number;
+    }) {
+        const finishTime = futureDate(duration * 1000);
+
+        this.task = new Task(steps, direction, finishTime, easing);
+        this.start();
+        this.emit('start', this.task);
+
+        return this.task.promise;
+    }
+    turnRotations({
         rotations = 1,
         direction = 1 as 1 | -1,
         duration = 5,
         easing = (x: number) => x,
     }) {
-        this.task?.reject(undefined);
+        if (this.task) {
+            this.turnOff(new Error('Manually stopped'));
+        }
 
-        const steps =
-            rotations * this.stepperConfig.stepsPerRotation * this.gearRatio;
-        const finishTime = futureDate(duration * 1000);
+        const steps = rotations * this.stepperConfig.stepsPerRotation * this.gearRatio;
 
-        this.task = new Task(steps, direction, finishTime, easing);
-        this.start();
+        return this.turnSteps({
+            steps,
+            direction,
+            duration,
+            easing,
+        });
+    }
 
-        return this.task.promise;
+    turnToTime({
+        time,
+        direction,
+        duration,
+        easing,
+    }: {
+        time: ClockTime;
+        direction?: -1 | undefined | 1;
+        duration: number;
+        easing?: (x: number) => number;
+    }) {
+        const destinationRatio = clockTimeToRatio(time);
+
+        const destinationStep = Math.round(destinationRatio * this.stepsPerRotation);
+        const currentStep = this.currentStep % this.stepsPerRotation;
+        const stepsBackwards = Math.abs(destinationStep - currentStep);
+        const stepsForwards = Math.abs(currentStep - destinationStep);
+
+        if (direction === undefined) {
+            direction = stepsBackwards > stepsForwards ? 1 : -1;
+        }
+
+        this.turnSteps({
+            steps: direction === 1 ? stepsForwards : stepsBackwards,
+            direction,
+            easing,
+            duration,
+        });
+    }
+
+    getClockTime() {
+        return ratioToClockTime(this.currentStep / this.stepsPerRotation);
+    }
+
+    getClockTimeString() {
+        const [hours, minutes, seconds] = this.getClockTime();
+
+        let secondsString = seconds < 10 ? `0${seconds}` : seconds.toString();
+
+        return `${hours.toString().padStart(2, '0')}:${minutes
+            .toString()
+            .padStart(2, '0')}:${secondsString}`;
     }
 }
