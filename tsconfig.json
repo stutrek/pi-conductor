@@ -1,0 +1,10 @@
+{
+    "extends": "@tsconfig/node10/tsconfig.json",
+    "compilerOptions": {
+        "preserveConstEnums": true,
+        "esModuleInterop": true,
+        "strict": true
+    },
+    "include": ["*", "./stepper.ts"],
+    "exclude": ["node_modules", "**/*.spec.ts"]
+}
