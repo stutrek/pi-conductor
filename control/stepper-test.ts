@@ -31,9 +31,9 @@ const pins = [5, 6, 13, 25];
     // });
 
     await stepper.turnToTime({
-        time: '2:45:00',
-        direction: 1,
-        duration: 1,
+        time: '1:00:00',
+        direction: -1,
+        duration: 4,
     });
 
     console.timeEnd('turn');

@@ -264,8 +264,8 @@ export class Stepper extends EventEmitter<StepperEvents> {
 
         const destinationStep = Math.round(destinationRatio * this.stepsPerRotation);
         const currentStep = this.currentStep % this.stepsPerRotation;
-        const stepsBackwards = Math.abs(destinationStep - currentStep);
         const stepsForwards = Math.abs(currentStep - destinationStep);
+        const stepsBackwards = this.stepsPerRotation - stepsForwards;
 
         if (direction === undefined) {
             direction = stepsBackwards > stepsForwards ? 1 : -1;
