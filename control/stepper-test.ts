@@ -1,18 +1,20 @@
 import { Stepper } from './stepper';
+import { World } from './world';
 import { easePolyIn, easePolyOut, easeQuadInOut } from 'd3-ease';
 import { clockTimeToRatio } from './circleUtils';
 
 const pins = [5, 6, 13, 25];
 
 (async () => {
+    const world = new World();
+
     const stepper = new Stepper({
         pinNumbers: pins,
         stepperModel: '28BYJ-48',
     });
 
-    console.log('time to ratio 3:00', clockTimeToRatio('3:00:00'));
-    console.log('time to ratio 6:00', clockTimeToRatio('6:00:00'));
-    console.log('time to ratio 9:00', clockTimeToRatio('9:00:00'));
+    world.addItem('stepper', stepper);
+    world.start();
 
     stepper.addListener('start', () => console.log('starting'));
     stepper.addListener('step', (step) => {
@@ -20,21 +22,16 @@ const pins = [5, 6, 13, 25];
             console.log('passed', stepper.getClockTimeString());
         }
     });
-    stepper.addListener('finish', () => console.log('finished'));
-
-    console.time('turn');
-    // await stepper.turnRotations({
-    //     rotations: 1,
-    //     direction: 1,
-    //     duration: 10,
-    //     easing: easeQuadInOut,
-    // });
-
-    await stepper.turnToTime({
-        time: '1:00:00',
-        direction: -1,
-        duration: 4,
+    stepper.addListener('finish', () => {
+        world.turnOff();
+        console.log('finished');
     });
 
-    console.timeEnd('turn');
+    stepper.turnToTime({
+        time: '11:00:00',
+        duration: 4,
+        direction: 1,
+    });
+
+    console.log(world.serialize());
 })();

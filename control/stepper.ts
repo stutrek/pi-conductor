@@ -2,7 +2,7 @@ import { Gpio } from 'pigpio';
 import NanoTimer from 'nanotimer';
 import EventEmitter from 'eventemitter3';
 
-import { clockTimeToRatio, ratioToClockTime, ClockTime } from './circleUtils';
+import { clockTimeToRatio, ratioToClockTime, ClockTime, clockTimeToString } from './circleUtils';
 
 function sleep(ms: number) {
     return new Promise((resolve) => {
@@ -93,6 +93,7 @@ type StepperEvents = {
     step: (currentStep: number, task: Task) => unknown;
     finish: (task: Task) => unknown;
     start: (task: Task) => unknown;
+    change: () => unknown;
 };
 
 export class Stepper extends EventEmitter<StepperEvents> {
@@ -116,80 +117,78 @@ export class Stepper extends EventEmitter<StepperEvents> {
     pins: Gpio[];
     stepperConfig: StepperConfig;
     task?: Task;
-    timer?: NanoTimer;
     currentStep: number;
+    destinationStep: number | undefined;
     stepsPerRotation: number;
+    isOn = false;
+
+    private currentStepPromise = Promise.resolve();
 
     private currentStepPatternIndex = 0;
 
-    private start() {
-        if (this.timer) {
-            return;
-        }
-        this.timer = new NanoTimer();
-        const continuer = async () => {
-            await this.step();
-            if (this.task && this.task.isComplete === false) {
-                this.timer?.setTimeout(continuer, '', '50u');
-            } else {
-                this.timer = undefined;
-                this.turnOff();
+    turnOn() {
+        if (this.isOn === false) {
+            const stepPattern = this.stepperConfig.pattern[0];
+            for (const pin of this.pins) {
+                if (stepPattern[0]) {
+                    pin.digitalWrite(stepPattern[0]);
+                }
             }
-        };
-        this.timer.setTimeout(continuer, '', '50u');
+            this.isOn = true;
+        }
     }
 
-    private async step() {
+    turnOff() {
+        for (const pin of this.pins) {
+            pin.digitalWrite(1);
+        }
+    }
+
+    step() {
         if (!this.task) {
             return undefined;
         }
-
         const stepsRequired = this.task.claimNextSteps();
         if (stepsRequired === 0) {
             return;
         }
 
-        for (var i = 0; i < stepsRequired; i++) {
-            this.incrementStepPatternIndex();
-            const stepPattern = this.stepperConfig.pattern[this.currentStepPatternIndex];
-
-            if (this.stepperConfig.delayAfterStep) {
-                await sleep(this.stepperConfig.delayAfterStep);
+        this.currentStepPromise = this.currentStepPromise.then(async () => {
+            if (!this.task) {
+                return undefined;
             }
 
-            if (this.stepperConfig.resetAfterStep) {
-                for (const pin of this.pins) {
-                    pin.digitalWrite(0);
+            for (var i = 0; i < stepsRequired; i++) {
+                this.incrementStepPatternIndex();
+                const stepPattern = this.stepperConfig.pattern[this.currentStepPatternIndex];
+
+                if (this.stepperConfig.delayAfterStep) {
+                    await sleep(this.stepperConfig.delayAfterStep);
                 }
-            }
 
-            for (const [pinIndex, pin] of this.pins.entries()) {
-                if (stepPattern[pinIndex]) {
-                    pin.digitalWrite(stepPattern[pinIndex]);
+                if (this.stepperConfig.resetAfterStep) {
+                    for (const pin of this.pins) {
+                        pin.digitalWrite(0);
+                    }
                 }
+
+                for (const [pinIndex, pin] of this.pins.entries()) {
+                    if (stepPattern[pinIndex]) {
+                        pin.digitalWrite(stepPattern[pinIndex]);
+                    }
+                }
+                this.currentStep += this.task.direction;
+                this.emit('step', this.currentStep, this.task);
+                this.emit('change');
             }
-            this.currentStep += this.task.direction;
-            this.emit('step', this.currentStep, this.task);
-        }
 
-        if (this.task.isComplete) {
-            this.turnOff();
-        }
-    }
-
-    private turnOff(error?: Error) {
-        if (this.task) {
-            if (error) {
-                this.task.reject(error);
-            } else {
-                this.task.resolve(undefined);
+            if (this.task.isComplete) {
                 this.emit('finish', this.task);
+                this.emit('change');
+                this.task.resolve(undefined);
+                this.task = undefined;
             }
-        }
-        this.task = undefined;
-        for (const pin of this.pins) {
-            pin.digitalWrite(1);
-        }
+        });
     }
 
     private incrementStepPatternIndex() {
@@ -208,6 +207,7 @@ export class Stepper extends EventEmitter<StepperEvents> {
     overwriteCurrentTime(newTime: ClockTime) {
         const ratio = clockTimeToRatio(newTime);
         this.currentStep = ratio * this.stepsPerRotation;
+        this.emit('change');
     }
 
     turnSteps({
@@ -222,13 +222,15 @@ export class Stepper extends EventEmitter<StepperEvents> {
         easing?: (x: number) => number;
     }) {
         const finishTime = futureDate(duration * 1000);
-
+        this.destinationStep =
+            direction === 1 ? this.currentStep + steps : this.currentStep - steps;
         this.task = new Task(steps, direction, finishTime, easing);
-        this.start();
         this.emit('start', this.task);
+        this.emit('change');
 
         return this.task.promise;
     }
+
     turnRotations({
         rotations = 1,
         direction = 1 as 1 | -1,
@@ -236,7 +238,7 @@ export class Stepper extends EventEmitter<StepperEvents> {
         easing = (x: number) => x,
     }) {
         if (this.task) {
-            this.turnOff(new Error('Manually stopped'));
+            this.task.reject(new Error('Manually stopped'));
         }
 
         const steps = rotations * this.stepperConfig.stepsPerRotation * this.gearRatio;
@@ -284,12 +286,16 @@ export class Stepper extends EventEmitter<StepperEvents> {
     }
 
     getClockTimeString() {
-        const [hours, minutes, seconds] = this.getClockTime();
+        return clockTimeToString(this.getClockTime());
+    }
 
-        let secondsString = seconds < 10 ? `0${seconds}` : seconds.toString();
-
-        return `${hours.toString().padStart(2, '0')}:${minutes
-            .toString()
-            .padStart(2, '0')}:${secondsString}`;
+    toSerializable() {
+        return {
+            currentPosition: this.getClockTimeString(),
+            destination: this.destinationStep
+                ? clockTimeToString(ratioToClockTime(this.destinationStep / this.stepsPerRotation))
+                : undefined,
+            taskFinishTime: this.task?.finishTime,
+        };
     }
 }

@@ -15,3 +15,11 @@ export const clockTimeToRatio = (clockTime: ClockTime) => {
     const time = hours + minutes / 60 + seconds / 3600;
     return time / 12;
 };
+
+export const clockTimeToString = ([hours, minutes, seconds]: number[]) => {
+    let secondsString = seconds < 10 ? `0${seconds}` : seconds.toString();
+
+    return `${hours.toString().padStart(2, '0')}:${minutes
+        .toString()
+        .padStart(2, '0')}:${secondsString}`;
+};
